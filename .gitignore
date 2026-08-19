@@ -4,4 +4,4 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .env
-"@ | Set-Content .gitignore
+"@ | Set-Content .gitignoreoutput/
