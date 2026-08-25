@@ -1,0 +1,10 @@
+source_file,table_name,rows_loaded,rows_rejected,fk_errors
+companies.xlsx,companies,101,0,0
+sectors.xlsx,company_sector,92,0,0
+profitandloss.xlsx,company_profit_loss,1164,0,0
+balancesheet.xlsx,company_balance_sheet,1137,0,0
+cashflow.xlsx,company_cashflow,1152,0,0
+financial_ratios.xlsx,company_ratios,1065,0,0
+market_cap.xlsx,company_valuation,552,0,0
+stock_prices.xlsx,company_price_history,460,0,0
+profitandloss.xlsx,company_financials,1164,0,0

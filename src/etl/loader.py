@@ -6,13 +6,24 @@ import pandas as pd
 from src.etl.normaliser import normalize_year, normalize_ticker
 
 
+# ============================================================
+# PATHS
+# ============================================================
+
 BASE_DIR = Path(__file__).resolve().parents[2]
+
 DATA_DIR = BASE_DIR / "data"
 SUPPORTING_DIR = BASE_DIR / "supporting datasets"
+
 DB_PATH = BASE_DIR / "nifty100.db"
 SCHEMA_PATH = BASE_DIR / "database" / "schema.sql"
+
 OUTPUT_DIR = BASE_DIR / "output"
 
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def get_connection(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
@@ -32,13 +43,30 @@ def initialize_database(db_path=DB_PATH, schema_path=SCHEMA_PATH):
     return conn
 
 
+# ============================================================
+# COMMON HELPERS
+# ============================================================
+
 def _read_excel(path):
+    """
+    Core datasets use header row 1.
+    Supporting datasets use header row 0.
+    """
+    if path.parent.name == "supporting datasets":
+        return pd.read_excel(path, header=0)
+
     return pd.read_excel(path, header=1)
 
 
 def _clean_company_id(value):
     if pd.isna(value):
         return None
+
+    value = str(value).strip()
+
+    if not value:
+        return None
+
     return normalize_ticker(value)
 
 
@@ -47,7 +75,12 @@ def _clean_number(value):
         return None
 
     if isinstance(value, str):
-        value = value.replace(",", "").replace("%", "").strip()
+        value = (
+            value.replace(",", "")
+            .replace("%", "")
+            .replace("₹", "")
+            .strip()
+        )
 
     try:
         return float(value)
@@ -57,15 +90,17 @@ def _clean_number(value):
 
 def _column(df, *names):
     """
-    Find a column using flexible matching.
+    Flexible column matching.
     """
+
     normalized = {
         re.sub(r"[^a-z0-9]", "", str(c).lower()): c
         for c in df.columns
     }
 
     for name in names:
-        key = re.sub(r"[^a-z0-9]", "", name.lower())
+        key = re.sub(r"[^a-z0-9]", "", str(name).lower())
+
         if key in normalized:
             return normalized[key]
 
@@ -81,16 +116,128 @@ def _value(row, df, *names):
     return row.get(col)
 
 
+def _valid_company_ids(conn):
+    """
+    Return all company IDs currently present in companies.
+    """
+
+    return {
+        str(row[0]).strip().upper()
+        for row in conn.execute(
+            "SELECT company_id FROM companies"
+        ).fetchall()
+        if row[0] is not None
+    }
+
+
+def _ensure_company_ids(conn, company_ids):
+    """
+    Add missing company IDs to companies so child tables
+    never violate the FK constraint.
+
+    The official 92 companies remain unchanged.
+    Extra IDs are added only when they actually occur
+    in source datasets.
+    """
+
+    existing = _valid_company_ids(conn)
+
+    rows = []
+
+    for company_id in company_ids:
+
+        if not company_id:
+            continue
+
+        company_id = str(company_id).strip().upper()
+
+        if company_id in existing:
+            continue
+
+        rows.append(
+            (
+                company_id,
+                company_id,
+                company_id,
+                None
+            )
+        )
+
+        existing.add(company_id)
+
+    if rows:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO companies
+            (company_id, company_name, ticker, sector)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows
+        )
+
+    return len(rows)
+
+
+def _collect_ids_from_file(path):
+    """
+    Read company IDs from any supported Excel file.
+    """
+
+    if not path.exists():
+        return set()
+
+    try:
+        df = _read_excel(path)
+    except Exception:
+        return set()
+
+    col = _column(
+        df,
+        "company_id",
+        "id",
+        "ticker",
+        "symbol"
+    )
+
+    if col is None:
+        return set()
+
+    result = set()
+
+    for value in df[col].dropna():
+        company_id = _clean_company_id(value)
+
+        if company_id:
+            result.add(company_id)
+
+    return result
+
+
+# ============================================================
+# COMPANIES
+# ============================================================
+
 def _load_companies(conn):
+
     path = DATA_DIR / "companies.xlsx"
+
+    if not path.exists():
+        return 0, 0
+
     df = _read_excel(path)
 
-    companies = {}
+    rows = {}
 
-    # Official companies
     for _, row in df.iterrows():
+
         company_id = _clean_company_id(
-            _value(row, df, "id", "company_id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         if not company_id:
@@ -107,73 +254,69 @@ def _load_companies(conn):
         if pd.isna(name) or name is None:
             name = company_id
 
-        companies[company_id] = (
+        rows[company_id] = (
             company_id,
             str(name).strip(),
             company_id,
             None
         )
 
-    # Collect IDs from all datasets to avoid FK failures
-    files = (
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO companies
+        (company_id, company_name, ticker, sector)
+        VALUES (?, ?, ?, ?)
+        """,
+        list(rows.values())
+    )
+
+    # --------------------------------------------------------
+    # Collect IDs from all datasets.
+    # This prevents FK failures from the 8 additional IDs.
+    # --------------------------------------------------------
+
+    all_files = (
         list(DATA_DIR.glob("*.xlsx"))
         + list(SUPPORTING_DIR.glob("*.xlsx"))
     )
 
-    for path in files:
-        try:
-            source = _read_excel(path)
-        except Exception:
-            continue
+    all_ids = set()
 
-        col = _column(
-            source,
-            "company_id",
-            "id",
-            "ticker",
-            "symbol"
-        )
+    for file in all_files:
+        all_ids.update(_collect_ids_from_file(file))
 
-        if col is None:
-            continue
+    _ensure_company_ids(conn, all_ids)
 
-        for value in source[col].dropna():
-            company_id = _clean_company_id(value)
+    return conn.execute(
+        "SELECT COUNT(*) FROM companies"
+    ).fetchone()[0], 0
 
-            if company_id and company_id not in companies:
-                companies[company_id] = (
-                    company_id,
-                    company_id,
-                    company_id,
-                    None
-                )
 
-    rows = list(companies.values())
-
-    conn.executemany(
-        """
-        INSERT OR IGNORE INTO companies
-        (company_id, company_name, ticker, sector)
-        VALUES (?, ?, ?, ?)
-        """,
-        rows
-    )
-
-    return len(rows), 0
-
+# ============================================================
+# SECTORS
+# ============================================================
 
 def _load_sectors(conn):
+
     path = SUPPORTING_DIR / "sectors.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
+
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         sector = _value(
@@ -188,8 +331,18 @@ def _load_sectors(conn):
             continue
 
         rows.append(
-            (company_id, str(sector).strip())
+            (
+                company_id,
+                str(sector).strip()
+            )
         )
+
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        row for row in rows
+        if row[0] in valid_ids
+    ]
 
     conn.executemany(
         """
@@ -203,23 +356,41 @@ def _load_sectors(conn):
     return len(rows), 0
 
 
+# ============================================================
+# PROFIT & LOSS
+# ============================================================
+
 def _load_profit_loss(conn):
+
     path = DATA_DIR / "profitandloss.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+            _value(
+                row,
+                df,
+                "year",
+                "financial_year",
+                "fy"
+            )
         )
 
         if not company_id or year is None:
@@ -229,26 +400,55 @@ def _load_profit_loss(conn):
             (
                 company_id,
                 year,
-                _clean_number(_value(row, df, "sales", "revenue")),
                 _clean_number(
-                    _value(row, df, "operating_profit", "op_profit")
+                    _value(row, df, "sales", "revenue")
                 ),
                 _clean_number(
-                    _value(row, df, "net_profit", "profit")
+                    _value(
+                        row,
+                        df,
+                        "operating_profit",
+                        "op_profit"
+                    )
                 ),
-                _clean_number(_value(row, df, "eps"))
+                _clean_number(
+                    _value(
+                        row,
+                        df,
+                        "net_profit",
+                        "profit"
+                    )
+                ),
+                _clean_number(
+                    _value(row, df, "eps")
+                )
             )
         )
 
+    # Remove duplicate PKs
     rows = list({
         (r[0], r[1]): r
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_profit_loss
-        (company_id, year, sales, operating_profit, net_profit, eps)
+        (
+            company_id,
+            year,
+            sales,
+            operating_profit,
+            net_profit,
+            eps
+        )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         rows
@@ -257,39 +457,71 @@ def _load_profit_loss(conn):
     return len(rows), 0
 
 
+# ============================================================
+# BALANCE SHEET
+# ============================================================
+
 def _load_balance_sheet(conn):
+
     path = DATA_DIR / "balancesheet.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+            _value(
+                row,
+                df,
+                "year",
+                "financial_year",
+                "fy"
+            )
         )
 
         if not company_id or year is None:
             continue
 
         equity = _clean_number(
-            _value(row, df, "total_equity", "equity")
+            _value(
+                row,
+                df,
+                "total_equity",
+                "equity"
+            )
         )
 
         if equity is None:
+
             capital = _clean_number(
-                _value(row, df, "equity_capital")
+                _value(
+                    row,
+                    df,
+                    "equity_capital"
+                )
             ) or 0
 
             reserves = _clean_number(
-                _value(row, df, "reserves")
+                _value(
+                    row,
+                    df,
+                    "reserves"
+                )
             ) or 0
 
             equity = capital + reserves
@@ -299,7 +531,12 @@ def _load_balance_sheet(conn):
                 company_id,
                 year,
                 _clean_number(
-                    _value(row, df, "total_assets", "assets")
+                    _value(
+                        row,
+                        df,
+                        "total_assets",
+                        "assets"
+                    )
                 ),
                 _clean_number(
                     _value(
@@ -311,10 +548,20 @@ def _load_balance_sheet(conn):
                 ),
                 equity,
                 _clean_number(
-                    _value(row, df, "cash", "other_asset")
+                    _value(
+                        row,
+                        df,
+                        "cash",
+                        "other_asset"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "debt", "borrowings")
+                    _value(
+                        row,
+                        df,
+                        "debt",
+                        "borrowings"
+                    )
                 )
             )
         )
@@ -324,11 +571,25 @@ def _load_balance_sheet(conn):
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_balance_sheet
-        (company_id, year, total_assets, total_liabilities,
-         total_equity, cash, debt)
+        (
+            company_id,
+            year,
+            total_assets,
+            total_liabilities,
+            total_equity,
+            cash,
+            debt
+        )
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         rows
@@ -337,23 +598,41 @@ def _load_balance_sheet(conn):
     return len(rows), 0
 
 
+# ============================================================
+# CASH FLOW
+# ============================================================
+
 def _load_cashflow(conn):
+
     path = DATA_DIR / "cashflow.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+            _value(
+                row,
+                df,
+                "year",
+                "financial_year",
+                "fy"
+            )
         )
 
         if not company_id or year is None:
@@ -402,12 +681,24 @@ def _load_cashflow(conn):
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_cashflow
-        (company_id, year, operating_cash_flow,
-         investing_cash_flow, financing_cash_flow,
-         free_cash_flow)
+        (
+            company_id,
+            year,
+            operating_cash_flow,
+            investing_cash_flow,
+            financing_cash_flow,
+            free_cash_flow
+        )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         rows
@@ -416,23 +707,41 @@ def _load_cashflow(conn):
     return len(rows), 0
 
 
+# ============================================================
+# RATIOS
+# ============================================================
+
 def _load_ratios(conn):
+
     path = SUPPORTING_DIR / "financial_ratios.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+            _value(
+                row,
+                df,
+                "year",
+                "financial_year",
+                "fy"
+            )
         )
 
         if not company_id or year is None:
@@ -443,13 +752,27 @@ def _load_ratios(conn):
                 company_id,
                 year,
                 _clean_number(
-                    _value(row, df, "opm", "operating_profit_margin")
+                    _value(
+                        row,
+                        df,
+                        "opm",
+                        "operating_profit_margin_pct",
+                        "operating_profit_margin"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "tax_rate")
+                    _value(
+                        row,
+                        df,
+                        "tax_rate"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "net_cash")
+                    _value(
+                        row,
+                        df,
+                        "net_cash"
+                    )
                 )
             )
         )
@@ -459,10 +782,23 @@ def _load_ratios(conn):
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_ratios
-        (company_id, year, opm, tax_rate, net_cash)
+        (
+            company_id,
+            year,
+            opm,
+            tax_rate,
+            net_cash
+        )
         VALUES (?, ?, ?, ?, ?)
         """,
         rows
@@ -471,23 +807,41 @@ def _load_ratios(conn):
     return len(rows), 0
 
 
+# ============================================================
+# VALUATION
+# ============================================================
+
 def _load_valuation(conn):
+
     path = SUPPORTING_DIR / "market_cap.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+            _value(
+                row,
+                df,
+                "year",
+                "financial_year",
+                "fy"
+            )
         )
 
         if not company_id or year is None:
@@ -498,16 +852,36 @@ def _load_valuation(conn):
                 company_id,
                 year,
                 _clean_number(
-                    _value(row, df, "market_cap")
+                    _value(
+                        row,
+                        df,
+                        "market_cap",
+                        "market_cap_crore"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "pe_ratio", "pe")
+                    _value(
+                        row,
+                        df,
+                        "pe_ratio",
+                        "pe"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "pb_ratio", "pb")
+                    _value(
+                        row,
+                        df,
+                        "pb_ratio",
+                        "pb"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "dividend_yield")
+                    _value(
+                        row,
+                        df,
+                        "dividend_yield",
+                        "dividend_yield_pct"
+                    )
                 )
             )
         )
@@ -517,11 +891,24 @@ def _load_valuation(conn):
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_valuation
-        (company_id, year, market_cap, pe_ratio,
-         pb_ratio, dividend_yield)
+        (
+            company_id,
+            year,
+            market_cap,
+            pe_ratio,
+            pb_ratio,
+            dividend_yield
+        )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         rows
@@ -530,24 +917,51 @@ def _load_valuation(conn):
     return len(rows), 0
 
 
+# ============================================================
+# STOCK PRICES
+# ============================================================
+
 def _load_prices(conn):
+
     path = SUPPORTING_DIR / "stock_prices.xlsx"
 
     if not path.exists():
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
-        year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+        # Stock prices contain dates.
+        # Extract the year from date.
+        raw_date = _value(
+            row,
+            df,
+            "date"
         )
+
+        year = None
+
+        if not pd.isna(raw_date):
+
+            try:
+                year = pd.to_datetime(
+                    raw_date
+                ).year
+            except Exception:
+                year = normalize_year(raw_date)
 
         if not company_id or year is None:
             continue
@@ -557,13 +971,28 @@ def _load_prices(conn):
                 company_id,
                 year,
                 _clean_number(
-                    _value(row, df, "close_price", "close")
+                    _value(
+                        row,
+                        df,
+                        "close_price",
+                        "close"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "high_price", "high")
+                    _value(
+                        row,
+                        df,
+                        "high_price",
+                        "high"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "low_price", "low")
+                    _value(
+                        row,
+                        df,
+                        "low_price",
+                        "low"
+                    )
                 )
             )
         )
@@ -573,10 +1002,23 @@ def _load_prices(conn):
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_price_history
-        (company_id, year, close_price, high_price, low_price)
+        (
+            company_id,
+            year,
+            close_price,
+            high_price,
+            low_price
+        )
         VALUES (?, ?, ?, ?, ?)
         """,
         rows
@@ -585,10 +1027,11 @@ def _load_prices(conn):
     return len(rows), 0
 
 
+# ============================================================
+# FINANCIALS
+# ============================================================
+
 def _load_financials(conn):
-    """
-    Load company_financials where compatible data exists.
-    """
 
     path = DATA_DIR / "profitandloss.xlsx"
 
@@ -596,16 +1039,29 @@ def _load_financials(conn):
         return 0, 0
 
     df = _read_excel(path)
+
     rows = []
 
     for _, row in df.iterrows():
 
         company_id = _clean_company_id(
-            _value(row, df, "company_id", "id", "ticker")
+            _value(
+                row,
+                df,
+                "company_id",
+                "id",
+                "ticker"
+            )
         )
 
         year = normalize_year(
-            _value(row, df, "year", "financial_year", "fy")
+            _value(
+                row,
+                df,
+                "year",
+                "financial_year",
+                "fy"
+            )
         )
 
         if not company_id or year is None:
@@ -616,16 +1072,34 @@ def _load_financials(conn):
                 company_id,
                 year,
                 _clean_number(
-                    _value(row, df, "revenue", "sales")
+                    _value(
+                        row,
+                        df,
+                        "revenue",
+                        "sales"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "profit", "net_profit")
+                    _value(
+                        row,
+                        df,
+                        "profit",
+                        "net_profit"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "eps")
+                    _value(
+                        row,
+                        df,
+                        "eps"
+                    )
                 ),
                 _clean_number(
-                    _value(row, df, "dividend")
+                    _value(
+                        row,
+                        df,
+                        "dividend"
+                    )
                 )
             )
         )
@@ -635,10 +1109,24 @@ def _load_financials(conn):
         for r in rows
     }.values())
 
+    valid_ids = _valid_company_ids(conn)
+
+    rows = [
+        r for r in rows
+        if r[0] in valid_ids
+    ]
+
     conn.executemany(
         """
         INSERT OR REPLACE INTO company_financials
-        (company_id, year, revenue, profit, eps, dividend)
+        (
+            company_id,
+            year,
+            revenue,
+            profit,
+            eps,
+            dividend
+        )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         rows
@@ -646,6 +1134,10 @@ def _load_financials(conn):
 
     return len(rows), 0
 
+
+# ============================================================
+# LOAD ALL
+# ============================================================
 
 def load_all(db_path=DB_PATH):
 
@@ -656,11 +1148,31 @@ def load_all(db_path=DB_PATH):
     audit = []
 
     loaders = [
-        ("companies.xlsx", "companies", _load_companies),
-        ("sectors.xlsx", "company_sector", _load_sectors),
-        ("profitandloss.xlsx", "company_profit_loss", _load_profit_loss),
-        ("balancesheet.xlsx", "company_balance_sheet", _load_balance_sheet),
-        ("cashflow.xlsx", "company_cashflow", _load_cashflow),
+        (
+            "companies.xlsx",
+            "companies",
+            _load_companies
+        ),
+        (
+            "sectors.xlsx",
+            "company_sector",
+            _load_sectors
+        ),
+        (
+            "profitandloss.xlsx",
+            "company_profit_loss",
+            _load_profit_loss
+        ),
+        (
+            "balancesheet.xlsx",
+            "company_balance_sheet",
+            _load_balance_sheet
+        ),
+        (
+            "cashflow.xlsx",
+            "company_cashflow",
+            _load_cashflow
+        ),
         (
             "financial_ratios.xlsx",
             "company_ratios",
@@ -686,10 +1198,19 @@ def load_all(db_path=DB_PATH):
     for filename, table, loader in loaders:
 
         try:
+
             loaded, rejected = loader(conn)
 
+            conn.commit()
+
         except Exception as e:
-            print(f"ERROR loading {filename}: {e}")
+
+            print(
+                f"ERROR loading {filename}: {e}"
+            )
+
+            conn.rollback()
+
             loaded = 0
             rejected = 0
 
@@ -702,7 +1223,9 @@ def load_all(db_path=DB_PATH):
             }
         )
 
-    conn.commit()
+    # ========================================================
+    # FINAL FK CHECK
+    # ========================================================
 
     fk_errors = conn.execute(
         "PRAGMA foreign_key_check"
@@ -717,6 +1240,7 @@ def load_all(db_path=DB_PATH):
         index=False
     )
 
+    conn.commit()
     conn.close()
 
     return audit_df, fk_errors
