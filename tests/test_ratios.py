@@ -8,8 +8,19 @@ from src.analytics.ratios import (
     return_on_capital_employed,
     return_on_assets,
     sector_relative_roce,
+    debt_to_equity,
+    high_leverage_flag,
+    interest_coverage_ratio,
+    icr_label,
+    icr_warning_flag,
+    net_debt,
+    asset_turnover,
 )
 
+
+# ============================================================
+# Day 08 - Profitability Ratio Tests
+# ============================================================
 
 def test_net_profit_margin_normal():
     assert net_profit_margin(20, 100) == 20
@@ -52,3 +63,39 @@ def test_roce_normal():
 
 def test_roa_zero_assets():
     assert return_on_assets(20, 0) is None
+
+
+# ============================================================
+# Day 09 - Leverage & Efficiency Ratio Tests
+# ============================================================
+
+def test_debt_to_equity_normal():
+    assert debt_to_equity(50, 100, 50) == pytest.approx(1 / 3)
+
+
+def test_debt_to_equity_debt_free_returns_zero():
+    assert debt_to_equity(0, 100, 50) == 0
+
+
+def test_debt_to_equity_negative_equity_returns_none():
+    assert debt_to_equity(50, -100, 20) is None
+
+
+def test_high_debt_equity_flag():
+    assert high_leverage_flag(6, "Information Technology") is True
+
+
+def test_financials_high_debt_equity_not_flagged():
+    assert high_leverage_flag(6, "Financials") is False
+
+
+def test_icr_interest_zero_returns_none():
+    assert interest_coverage_ratio(100, 20, 0) is None
+
+
+def test_icr_label_debt_free():
+    assert icr_label(None) == "Debt Free"
+
+
+def test_icr_warning_flag():
+    assert icr_warning_flag(1.2) is True
