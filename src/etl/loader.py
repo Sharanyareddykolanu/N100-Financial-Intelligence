@@ -647,7 +647,8 @@ def _load_cashflow(conn):
                         row,
                         df,
                         "operating_cash_flow",
-                        "cash_from_operating"
+"operating_activity",
+"cash_from_operating"
                     )
                 ),
                 _clean_number(
@@ -655,16 +656,16 @@ def _load_cashflow(conn):
                         row,
                         df,
                         "investing_cash_flow",
-                        "cash_from_investing"
-                    )
+"investing_activity",
+"cash_from_investing"                    )
                 ),
                 _clean_number(
                     _value(
                         row,
                         df,
-                        "financing_cash_flow",
-                        "cash_from_financing"
-                    )
+                       "financing_cash_flow",
+"financing_activity",
+"cash_from_financing"                    )
                 ),
                 _clean_number(
                     _value(

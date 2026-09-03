@@ -263,11 +263,7 @@ def populate_financial_ratios(db_path=DEFAULT_DB):
         # Dividend payout
         # ----------------------------------------------------
 
-        dividend_payout = _safe_divide(
-            dividend * 100 if dividend is not None else None,
-            net_profit,
-        )
-
+       	dividend_payout = None
         # ----------------------------------------------------
         # 5-year CAGR
         # ----------------------------------------------------
