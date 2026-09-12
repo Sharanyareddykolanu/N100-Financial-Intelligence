@@ -1,19 +1,11 @@
 import sqlite3
 
 conn = sqlite3.connect("nifty100.db")
+cur = conn.cursor()
 
-tables = conn.execute("""
-    SELECT name
-    FROM sqlite_master
-    WHERE type = 'table'
-    ORDER BY name
-""").fetchall()
+cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
 
-for (table,) in tables:
-    print(f"\nTABLE: {table}")
-    columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
-
-    for column in columns:
-        print(column)
+for row in cur.fetchall():
+    print(row[0])
 
 conn.close()
